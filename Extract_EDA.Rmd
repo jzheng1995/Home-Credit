@@ -1,25 +1,17 @@
 ---
-title: "Home credit ETL"
+title: "Preliminary Data Extraction"
 author: "Jason"
-date: "`r Sys.Date()`"
 output: 
-  html_document:
-    html_preview: true
-    toc: true
-    toc_float: true
-    toc_depth: 2
-    number_sections: true
-    theme: united
-    code_folding: hide
+  md_document:
+    variant: markdown_github
 ---
-
-# Introduction
+## Introduction
 
 This is primarily an ETL document for the 2024 home credit competition data on Kaggle. This will also be a first attempt at 1) a kaggle competition, 2) approaching this dataset, and 3) documenting the bottom-up process for public review. This will primarily be a reference for myself on how to improve on all these aspects. The goal of this competition is to predict `target` class from all the provided features. 
 
-# Set up
+## Set up
 
-## Libraries
+### Libraries
 ```{r}
 library(tidyverse)
 library(here)
@@ -28,11 +20,22 @@ library(RSQLite)
 library(reticulate)
 library(tools)
 library(data.tree)
+library(rmarkdown)
 
 con <- dbConnect(SQLite(), "mydb")
 ```
 
-## File import
+```{r}
+# quick rds save/load
+rdsread <- function(name, envr = globalenv()){
+  assign(x = name, read_rds(str_c(name,".rds")),envir = envr)
+}
+quickrds <- function(x){
+  saveRDS(get(x),str_c(x, ".rds"))
+}
+```
+
+### File import
 
 When I first approached these data, I attempted to read the all the csv files into my R environment through `read_csv()`. As it turns out, the data contained millions of rows for multiple files and were clearly too big to import for my laptop memory. My roundabout strategy in circumventing this problem was creating a local relational database (SQLite), trim the data down on the database side, and then import a data table that's hopefully small enough to work with. 
 
@@ -73,9 +76,9 @@ for (i in seq(length(test_paths))){
 }
 ```
 
-# Overview
+## Overview
 
-## SQL overview
+### SQL overview
 
 Since the data is relatively unknown at this point, here are some useful SQL/r functions to extract some useful overviews. We'll perform these on the `train` subset of csv files. 
 
@@ -89,7 +92,7 @@ train_fields <- tibble(table_name = train_names_noext) %>% mutate(
   info = map(table_name, ~dbGetQuery(con, str_c("PRAGMA table_info(",.,")")))
 )
 # show
-train_fields %>% select(info) %>% unnest(info) 
+train_fields %>% select(info) %>% unnest(info) %>% select(name, type) %>%  head()
 ```
 
 * `dbListTables`: DBI function to examine existing table names
@@ -97,39 +100,48 @@ train_fields %>% select(info) %>% unnest(info)
 ```{r}
 # table names
 datatables <- dbListTables(con)
-# show original table names
-(original_table_names <- tibble(table = datatables) %>%  
+# original table names
+original_table_names <- tibble(table = datatables) %>%  
   # filter out future added table names
   filter(str_detect(table, "test|train"),
-  str_detect(table, "id|ID|dated|_U|joined", negate = TRUE)) )
+  str_detect(table, "id|ID|_U|joined", negate = TRUE)) 
+# show
+original_table_names %>% head() 
 ```
 
-There are `r train_fields %>% unnest() %>% nrow()` columns across `r original_table_names %>% nrow()` tables. Some recurring columns are `case_id`, `num_group1`, and `num_group2`. `case_id` is clearly an unique row identifier for each person. Based on the Kaggle data description, `num_group1` and `num_group2` are meant to index `case_id` when there are multiple row entries per `case_id` (e.g. historical loan contracts). 
+There are `r train_fields %>% unnest(info) %>% nrow()` columns across `r original_table_names %>% nrow()` tables. Some recurring columns are `case_id`, `num_group1`, and `num_group2`. `case_id` is clearly an unique row identifier for each person. Based on the Kaggle data description, `num_group1` and `num_group2` are meant to index `case_id` when there are multiple row entries per `case_id` (e.g. historical loan contracts). 
 
-## File naming patterns
+### File naming patterns
 
 We can also examine the structure of the files with a `data.tree` below. 
 
 ```{r}
+# set up nodes
 homecredit<- Node$new("home-credit-credit-risk-model-stability")
 csvfiles <- homecredit$AddChild("csv_files")
 train <- csvfiles$AddChild("train")
 test <- csvfiles$AddChild("test")
 
+# add train nodes
 for (i in (original_table_names %>% filter(str_detect(table, "train")) %>% pull(table))){
   train$AddChild(i)}
-
+# add test nodes
 for (i in (original_table_names %>% filter(str_detect(table, "test")) %>% pull(table))){
   test$AddChild(i)}
-
-print(homecredit)
+# show
+homecredit %>% 
+  as.data.frame() %>% 
+  as.matrix() %>% 
+  print(quote=FALSE)
 ```
+
+
 
 We see that all the original csv files are organized by a prefix `test_` or `train_`. These can be further related by numeral suffixes that denote either 1) related tables split by columns (`train_person_1`, `train_person_2`) or 2) related tables split by rows (`train_credit_bureau_a_2_1`,`train_credit_bureau_a_2_2`,...,`train_credit_bureau_a_2_8`). 
 
 In addition, a `feature_definitions.csv` file was provided that mapped column names to feature definitions. For future reference, we create a tibble to map feature definitions to column names to table names. 
 
-```{r}
+```{r,class.output ="watch-out"}
 # import feature definitions
 features <- here("home-credit-credit-risk-model-stability","feature_definitions.csv") %>% read_csv(show_col_types = FALSE)
 
@@ -138,29 +150,35 @@ train_features <- train_fields %>% unnest(everything()) %>% left_join(features, 
 train_features %>% select(fields, table_name,Description ) %>% head()
 ```
 
-## Base_train
+### Base_train
 
-The goal of this competition is to predict `target`, which can be found in `train_base`. Here's some information on `train_base`.
+The goal of this competition is to predict `target`, which can be found in `train_base`. The definition of `target`, found on a [forum Q&A](https://www.kaggle.com/competitions/home-credit-credit-risk-model-stability/discussion/477074), is defined as:  
+```
+...unpaid payment (one is enough) in certain time period. There is also some time tolerance (e.g. one day late is not default) and amount tolerance (if client paid $100 instead of $100.10) ). 
+```
 
-* Column names, type
+Here's some information on `train_base`.
 
-```{r}
+* **Column names, type**
+
+    ```{r}
 # Base training dataset - summary
 # table columns
 base_columns <- dbGetQuery(con, "PRAGMA table_info(train_base)")
-base_columns %>% head()
-```
-* Number of rows
+base_columns %>% head() 
+    ```
 
-```{r}
+* **Number of rows**
+
+    ```{r}
 # table rows
 base_rows <- dbGetQuery(con, "SELECT COUNT(*) FROM train_base")
-base_rows %>% head()
-```
+base_rows %>% head() 
+    ```
 
-* Number of rows per participant
+* **Number of rows per participant**
 
-```{r}
+    ```{r}
 # rows per participant
 base_rows_per_id <- dbGetQuery(con, "SELECT case_id, COUNT(*) FROM train_base GROUP BY case_id")
 base_rows_per_id %>% head()
@@ -172,52 +190,47 @@ FROM train_base
 GROUP BY case_id)
 GROUP BY row_count")
 
-row_per_users %>% head()
-```
+row_per_users %>% head() 
+    ```
+
 Now we have an idea of the main table we'll be working with. Since the prediction `target` is only available for the `case_id` present in `train_base`, the first step for reducing the data load is to filter for the same `case_id` in all the other supplemental tables. Before we do that, however, I want to simplify the number of tables I have by joining tables split by rows. This will reduce the number of table `LEFT JOIN`s I will have to perform later on. 
 
-## Joining split tables
+### Joining split tables
 
 The split tables we're looking for share the same `columns` but different `rows`. We want to 1) identify tables sharing the same columns , 2) identify the shared naming scheme that tbese split tables use, and 3) join the split table rows by the common naming scheme.  Here are the steps to set this up:
 
-* Create a tibble with all table names mapped to all column names
+* Create a tibble with original table names mapped to all column names
 
-```{r}
+```{r,class.source = 'fold-show'}
+# renew datatable
+datatables <- dbListTables(con)
 # Filter original tables
 original_fields <- tibble(table = datatables) %>% filter(
   str_detect(table, "test|train"),
-  str_detect(table, "id|ID|dated|_U|joined", negate = TRUE)
+  str_detect(table, "id|ID|_U|joined", negate = TRUE)
 ) %>% mutate(
   fields = map(table, ~dbListFields(con, .)),
   info = map(table, ~dbGetQuery(con, str_c("PRAGMA table_info(",.,")")))
 ) %>% select(table, fields) %>% unnest(fields)
 ```
 
-* Extract common naming scheme using regex
 
-```{r}
-# extract shared table naming scheme 
-updated_tables_revised <- original_fields %>% 
-  mutate(table_name_extract =str_extract(table,".*[A-Za-z_]*_\\d(?=_\\d)" )) %>%
-  mutate(updated_table_names = ifelse(!is.na(table_name_extract),table_name_extract,table)) %>%
-  select(updated_table_names, fields) %>% unnest(fields)
-```
+* First extract common naming scheme using regex. We then map the naming scheme to original table name and its respective number of columns. We expect that for any set tables sharing a common scheme, the set should share the same number of columns.
 
-* Map naming scheme to original table name and its respective number of columns. We expect that for any table sharing a common scheme, all the number of columns should be the same. 
-
-```{r}
+```{r,class.source = 'fold-show'}
 # map extracted scheme to original table name, # of columns
-(split_datasets_revised <- original_fields %>% select(table) %>% unique() %>% 
+split_datasets_revised <- original_fields %>% select(table) %>% unique() %>% 
   mutate(table_name_extract =str_extract(table,"[A-Za-z_]*_\\d(?=_\\d)" )) %>% 
   select(table, table_name_extract) %>% mutate(
-  ncol = map(table, ~dbGetQuery(con, str_c("PRAGMA table_info(",.,")")) %>% nrow()) ) %>% unnest(ncol))
+  ncol = map(table, ~dbGetQuery(con, str_c("PRAGMA table_info(",.,")")) %>% nrow()) ) %>% unnest(ncol)
+split_datasets_revised %>% head()
 ```
 
 * Set up the join query for split tables. Since these are vertical rowbinding, we use `UNION` statements to create new joined tables suffxied with `_U`. 
 
 ```{r}
 # joined table set names
-split_dataset_names <- split_datasets_revised$table_name_extract %>% unique() %>% na.omit()
+split_dataset_names <- split_datasets_revised$table_name_extract %>% unique() %>% discard(is.na)
 # create UNION/create table query for every split tables
 union_query_revised <- 
   # extract unique shared table names
@@ -237,48 +250,51 @@ union_query_revised <-
          write_query = str_c("CREATE TABLE IF NOT EXISTS ",table_name_extract,"_U"," AS ", union_query))
 
 # examine the queries
-union_query_revised$write_query %>% head()
+union_query_revised %>% select(table_name_extract,write_query) %>% head() 
+quickrds("split_dataset_names")
+
 ```
 
 ```{r, eval = FALSE}
 # SQL - union 
 # execute each query
-for (i in union_query_revised$write_query){
-  dbExecute(con, i)
-}
+union_query_revised$write_query %>% walk(~dbExecute(con,.))
 ```
 
-# Filter data 
+## Subset supplemental data
 
-Since the main focus of the operation is predicting target from train_base, we reduce the server load by first filtering out train_base participant data from all the other tables. These ID-filtered out tables have the suffix "_id".
+Since the main focus of the operation is predicting `target` from `train_base`, we can reduce our operations to just data that's available for `case_id`s that are present in `train_base`. This can be done by using `INNER JOIN` and filtering out data from all supplemental sources with `train_base$case_id`. 
+
+* First subset `case_id` column from base tables
 ```{r, eval = FALSE}
 # create IDs to filter out relevant IDs in data tables
-
 dbExecute(con,"CREATE TABLE IF NOT EXISTS train_id AS SELECT case_id FROM train_base")
 dbExecute(con,"CREATE TABLE IF NOT EXISTS test_id AS SELECT case_id FROM test_base")
 ```
 
-
-Some of the data sets have multiple rows per participant. The key for the main participant data is the value 0 for numgroup_1 and numgroup_2. Here we set up a numgroup mapping for future joining operations.
-
+* Some of supplemental tables have multiple rows per participant. The key for the main participant data is the value 0 for numgroup_1 and numgroup_2. Here we set up a numgroup tibble for future mapping. (1 = 0 mapping, 0 = other number)
 ```{r}
 # numgroup index
 numgroup_tibble <- original_fields %>% 
   filter(str_detect(fields, "num_group")) %>% 
   pivot_wider(names_from = fields, values_from = fields, values_fn = ~1, values_fill = 0) 
 
+numgroup_tibble %>% head()
 ```
 
+* Create query to `INNER JOIN` and filter tables by `train_base$case_id`, `numgroup` and save filtered tables with a `_id` suffix. 
+    ```{r}
+  # renew data table
+datatables <- dbListTables(con)
 
-```{r}
+  # filter data by id
 id_join_query_revised <- tibble(tables = datatables) %>% 
-  # filter out everything other than train/test datasets 
+  # filter for original tables,joined tables 
   filter(
+    # filter out split table names
     str_detect(tables,str_c(str_c(split_dataset_names,"_\\d"), collapse = "|"),
-               negate = TRUE),
-    str_detect(tables, "joined|dated",negate = TRUE))%>% 
-  filter(str_detect(tables, "id|ID", negate = TRUE)) %>% 
-  filter(str_detect(tables, "base", negate = TRUE))%>% 
+               negate = TRUE))%>% 
+  filter(str_detect(tables, "id|ID|joined|base", negate = TRUE)) %>% 
   filter(str_detect(tables, "train|test")) %>% 
   # create query
   mutate(
@@ -293,7 +309,7 @@ id_join_query_revised <- tibble(tables = datatables) %>%
     str_detect(tables, "test") ~ str_c(query, ".case_id = test_id.case_id")
   )
 )
-
+  # filter rows by num_group
 id_join_query_num <- id_join_query_revised %>% left_join(numgroup_tibble , by = c("tables" = "table")) %>% mutate(
   query = case_when(
     num_group1 == 1 & num_group2 == 0 ~ str_c(query, " AND num_group1 = 0"),
@@ -301,33 +317,35 @@ id_join_query_num <- id_join_query_revised %>% left_join(numgroup_tibble , by = 
     .default = query
   )
 )
-```
-
+  # show queries
+id_join_query_num$query %>% head()
+    ```
 
 ```{r, eval = FALSE}
 # execute
-
-id_join_query_num$query %>% lapply(.,tablexecute)
-datatablestest[str_detect(datatablestest,"_id")] %>% str_c(
-)
-
-id_join_query_num %>% 
-  mutate(tables_id = str_c(tables, "_id"),
-         query = str_c("ALTER TABLE ",tables_id, " DROP "),
-         querynum = case_when(
-           num_group1 == 1 & num_group2 == 0 ~ str_c(query, "num_group1"),
-           num_group1 == 1 & num_group2 == 1  ~ str_c(query, "num_group1 = 0 AND num_group2 = 0")
-                             ))
+id_join_query_num$query %>% walk(~dbExecute(con,.))
 ```
 
-```{r}
-id_join_query_revised$query %>% head()
-```
+## Joining features 
 
-# Identify potential features 
+### Feature subset
+To facilitate a quick analysis we're going to pick out some variables that I think are theoretically relevant in predicting `target`:
 
-Because all the tables have many columns, we can make data wrangling more manageable by a priori selecting columns that appear to be the most relevant factors in predicting target. Thus, revised_feature_list is manually constructed based on theoretical grounds.
-```{r}
+1. `birth_259D`: Birth date
+1. `education_927M`: Education
+1. `empl_employedfrom_271D`: Employment date
+1. `empl_employedtotal_800L`: Employment length
+1. `empl_industry_691L`: Job industry
+1. `familystate_447L`: Family status
+1. `incometype_1044TL`: Salary type
+1. `mainoccupationinc_384A`: Income amount
+1. `riskassesment_940T`: Normalized risk - assessed by credit bureau
+
+### Join SQL
+
+* We can use a tibble to map the selected features to their respective tables. 
+
+    ```{r}
 # highlight features of interest and identify within datatables
 
 # pick features of interest and rename
@@ -342,17 +360,8 @@ revised_feature_list <- list(
                "incometype_1044T", # salary type
                "mainoccupationinc_384A"# income amount
                ), 
-  static_cb_0_id = c("riskassesment_940T", #risk assessment - normalized
-                           "days30_165L", # cb queries in past 30 days
-                           "days90_310L",# cb queries in past 90 days
-                           "days120_123L",# cb queries in past 120 days
-                           "days180_256L",# cb queries in past 180 days
-                           "days360_512L"# cb queries in past 360  days
-                           )
-) 
-
-
-
+  static_cb_0_id = c("riskassesment_940T" #risk assessment - normalized
+                           )) 
 # link features of interest to data tables
 revised_features_tbl <- 
   # set up variables as tibble
@@ -360,25 +369,11 @@ revised_features_tbl <-
          train_table = str_c("train_", table),
          test_table = str_c("test_", table),
        features = revised_feature_list ) %>% unnest(features)
+    ```
 
-```
-
-Since some of these tables have multirow data, we use the numgroup tibble to create filtering query statements prior to joining them to train_base.
-```{r}
-# filter out multirow data through numgroup
-num_group_query <- numgroup_tibble %>% 
-  mutate(
-    table = str_c(table, "_id"),
-    num1_query = ifelse(num_group1 ==1, 
-                        str_c(" AND ", table, ".num_group1 = 0"),
-                        ""
-                        ))
-
-```
-
-Once we're set up, we can make a tibble that organizes all the relevant features and create left_join statements to train_base.
-```{r}
-# organize and iterate query sections
+* We'll then set up the query parts using the mapped tibble.
+    ```{r}
+# create query for joining relevant features to train_base
 train_join <- revised_features_tbl %>% filter(str_detect(features, "case_id", negate = TRUE)) %>% na.omit() %>% 
   # table.column query
   mutate(
@@ -390,7 +385,7 @@ train_join <- revised_features_tbl %>% filter(str_detect(features, "case_id", ne
     join_id_string = str_c(join_string, id_string)
   ) %>% unique()
 
-# organize and iterate query sections
+# create query for joining relevant features to train_test
 test_join <- revised_features_tbl %>% filter(str_detect(features, "case_id", negate = TRUE)) %>% na.omit() %>% 
   # table.column query
   mutate(
@@ -401,13 +396,18 @@ test_join <- revised_features_tbl %>% filter(str_detect(features, "case_id", neg
     id_string = str_c("test_base.case_id = ",test_table, ".case_id"),
     join_id_string = str_c(join_string, id_string)
   ) %>% unique()
+    ```
+   - `train_base` set up
+    ```{r}
+      train_join %>% select(table_column, join_id_string) %>% head()
+    ```
+   - `test_base` set up
+    ```{r}
+      test_join %>% select(table_column, join_id_string) %>% head()
+    ```
 
-train_join %>% head()
-test_join %>% head()
-```
-
-
-```{r}
+* The parts can be strung together for the final query.
+    ```{r}
 # create the final train join query
 
 # all join TABLE on TABLE
@@ -424,10 +424,7 @@ train_join_query <- train_table_column_join   %>%
   str_c(., " ",train_join_list) %>% 
   # save as new table
   str_c("CREATE TABLE IF NOT EXISTS train_joined AS ",.)
-```
 
-
-```{r}
 # create the final train join query
 
 # all join TABLE on TABLE
@@ -444,120 +441,41 @@ test_join_query <- test_table_column_join   %>%
   str_c(., " ",test_join_list) %>% 
   # save as new table
   str_c("CREATE TABLE IF NOT EXISTS test_joined AS ",.)
-```
-
-```{r}
-train_join_query
-test_join_query
-```
+    ```
+    - `train_base` join query
+    ```{r}
+    train_join_query 
+    ```
+    - `test_base` join query
+    ```{r}
+    test_join_query
+    ```
 
 
 ```{r, eval = FALSE}
 # join tables with selected features
-dbRemoveTable(con, "train_joined")
 dbExecute(con, test_join_query)
 dbExecute(con, train_join_query)
 ```
 
-# All feature join tables
-```{r}
-# highlight features of interest and identify within datatables
+## Data analysis
 
-all_features_tbl <- tibble(table = datatables) %>% mutate(
-  fields = map(table, ~dbListFields(con, .)),
-  info = map(table, ~dbGetQuery(con, str_c("PRAGMA table_info(",.,")")))
-)
+Now that we have a dataset with all our relevant features, we can move into data anaysis and prediction. First we need to define our variable types across our test and train data. 
 
-all_features_tbl <- tibble(tables = datatables) %>% 
-  # filter out everything other than train/test datasets 
-  filter(
-    str_detect(tables,str_c(str_c(split_dataset_names,"_\\d"), collapse = "|"),
-               negate = TRUE),
-    str_detect(tables, "joined|dated",negate = TRUE))%>% 
-  filter(str_detect(tables, "id|ID", negate = TRUE)) %>% 
-  filter(str_detect(tables, "base", negate = TRUE))%>% 
-  filter(str_detect(tables, "train|test"))  %>% 
-  mutate(table_id = str_c(tables, "_id")) %>% 
-  filter(str_detect(table_id, "base", negate = T)) %>% mutate(
-  fields = map(table_id, ~dbListFields(con, .))) %>% unnest(fields) %>% filter(
-    str_detect(fields, "num_group|case_id:1", negate = T)
-  )
-# train
-train_joined2 <- all_features_tbl %>% filter(str_detect(table_id, "train_")) %>% 
-  mutate(
-    column = str_c(table_id, ".",fields),
-    join_string = str_c("LEFT JOIN ", table_id, " ON "),
-    id_string = str_c("train_base.case_id = ",table_id, ".case_id"),
-    join_id_string = str_c(join_string, id_string),
-    query = str_c(join_string, id_string))
-# test
-test_joined2 <- all_features_tbl %>% filter(str_detect(table_id, "test_")) %>% 
-  mutate(
-    column = str_c(table_id, ".",fields),
-    join_string = str_c("LEFT JOIN ", table_id, " ON "),
-    id_string = str_c("test_base.case_id = ",table_id, ".case_id"),
-    join_id_string = str_c(join_string, id_string),
-    query = str_c(join_string, id_string))
-
-
-```
-
-## train
-```{r}
-# create the final train join query
-
-# all join TABLE on TABLE
-train_join_list2 <- train_joined2$query %>% unique() %>%  str_c(collapse = " ")
-# all TABLE.COLUMNS
-train_table_column_join2 <- train_joined2$column %>% str_c(collapse = ", ") 
-# full query
-train_join_query2 <- train_table_column_join2   %>% 
-  # select train_base columns 
-  str_c("SELECT train_base.*, ",.) %>% 
-  # FROM train_base
-  str_c(., " FROM train_base") %>% 
-  # left join table statements
-  str_c(., " ",train_join_list2) %>% 
-  # save as new table
-  str_c("CREATE TABLE IF NOT EXISTS train_joined_all AS ",.)
-```
-
-## test
-```{r}
-# create the final test join query
-
-# all join TABLE on TABLE
-test_join_list2 <- test_joined2$query %>% unique() %>%  str_c(collapse = " ")
-# all TABLE.COLUMNS
-test_table_column_join2 <- test_joined2$column %>% str_c(collapse = ", ") 
-# full query
-test_join_query2 <- test_table_column_join2   %>% 
-  # select test_base columns 
-  str_c("SELECT test_base.*, ",.) %>% 
-  # FROM test_base
-  str_c(., " FROM test_base") %>% 
-  # left join table statements
-  str_c(., " ",test_join_list2) %>% 
-  # save as new table
-  str_c("CREATE TABLE IF NOT EXISTS test_joined_all AS ",.)
-```
-
-```{r, eval = FALSE}
-dbExecute(con, test_join_query2)
-dbExecute(con, train_join_query2)
-```
-
-# Data analysis
-
-Now that we have a dataset with all our relevant features, we can move into data anaysis and prediction. First we need to define our variable types across our test and train data.  
-```{r,eval = FALSE}
+```{r,eval = FALSE, warning = FALSE}
 # read train table
 train_joined_df <- dbGetQuery(con, "SELECT * FROM train_joined") %>% tibble()
-saveRDS(train_joined_df,"train_joined_df.rds")
+"train_joined_df" %>% quickrds()
+# read test table
+test_joined_df <- dbGetQuery(con, "SELECT * FROM test_joined") %>% tibble()
+"test_joined_df" %>% quickrds()
 ```
 
-
-```{r,warning = FALSE}
+* Import and define variable types. 
+    - `
+    - `categorical` variables (e.g., )
+    - `numeric`: 
+    ```{r,warning = FALSE, class.source = 'fold_show'}
 train_joined_df<- read_rds("train_joined_df.rds")
 # define train table variables
 train_joined_tbl <- train_joined_df %>%   
@@ -571,19 +489,16 @@ train_joined_tbl <- train_joined_df %>%
   week.n = WEEK_NUM %>% as.numeric())  %>%
   # label numeric, factors
   mutate(
-    across(c(matches("mainoccupationinc_384A|riskassesment_940T|days30_165L|
-                     days90_310L|days120_123L|days180_256L|days360_512L|
+    across(c(matches("mainoccupationinc_384A|riskassesment_940T|
                      age|\\.n")), 
            ~ as.numeric(.)),
     across(c(matches("education_927M|empl_employedtotal_800L|empl_industry_691L|
                      familystate_447L|incometype_1044T|target|familystate_447L")), 
            ~ as.factor(.))) 
-
-```
-
-```{r,warning = FALSE}
-# read test table
-test_joined_df <- dbGetQuery(con, "SELECT * FROM test_joined") %>% tibble()
+"train_joined_tbl" %>% quickrds()
+    ```
+    ```{r,warning = FALSE}
+test_joined_df<- read_rds("test_joined_df.rds")
 
 # define test table variables
 test_joined_tbl <- test_joined_df %>%   
@@ -597,38 +512,46 @@ test_joined_tbl <- test_joined_df %>%
   week.n = WEEK_NUM %>% as.numeric()) %>%
   # label numeric, factors
   mutate(
-    across(c(matches("mainoccupationinc_384A|riskassesment_940T|days30_165L|
-                     days90_310L|days120_123L|days180_256L|days360_512L|
+    across(c(matches("mainoccupationinc_384A|riskassesment_940T|
                      age|\\.n")), 
            ~ as.numeric(.)),
     across(c(matches("education_927M|empl_employedtotal_800L|empl_industry_691L|
                      familystate_447L|incometype_1044T|target|familystate_447L")), 
            ~ as.factor(.))) 
-```
-```{r}
-train_joined_tbl %>% glimpse()
-test_joined_tbl %>% glimpse()
-```
+"test_joined_tbl" %>% quickrds()
+    ```
+    - `train` df
+    ```{r}
+    train_joined_tbl %>% glimpse()
+    ```
+    - `test` df
+    ```{r}
+    test_joined_tbl %>% glimpse()
+    ```
 
-## Summary statistics
+### Summary statistics
 
-A brief look at each variable's summary statistics shows that riskassesment_940T has only ~3% valid entries. The daysXX_XXXL variables also may need to context to use so we will leave these ones out of the analysis for now. 
+Here's a look at some summary statistics. 
+
+### Nominal variables
 
 ```{r}
 library(summarytools)
-library(naniar)
-
-# summary statistics 
 
 # factor level proportions
 train_joined_tbl %>% select(where(is.factor)) %>% freq()
-
-# numeric variable summaries
-train_joined_tbl %>% select(where(is.numeric)) %>% descr()
-
 ```
 
+### Numeric variables
 
+```{r}
+# numeric variable summaries
+train_joined_tbl %>% select(where(is.numeric)) %>% descr()
+```
+
+### Summary
+
+We see that `riskassesment_940T` has `r (mean(is.na(train_joined_tbl$riskassesment_940T))*100) %>% round(.,1) `% missing entries so it may be best to leave it out for now. 
 
 
 

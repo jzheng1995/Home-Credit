@@ -1,0 +1,287 @@
+---
+title: "Preliminary Analysis"
+author: "Jason"
+output: 
+  md_document:
+    variant: markdown_github
+---
+# Introduction
+
+Now that we have our data set up we can continue on analysis and model training. 
+
+## Set up
+
+### Libraries
+```{r}
+library(tidyverse)
+library(here)
+library(tools)
+library(tidymodels)
+library(doParallel)
+library(h2o)
+```
+
+### Import data
+```{r}
+# quick rds save/load
+rdsread <- function(name, envr = globalenv()){
+  assign(x = name, read_rds(str_c(name,".rds")),envir = envr)
+}
+quickrds <- function(x){
+  saveRDS(get(x),str_c(x, ".rds"))
+}
+```
+```{r}
+rdsread("train_joined_tbl")
+rdsread("test_joined_tbl")
+```
+
+
+### Train test split
+
+We'll split our data into train and test sets. 
+```{r}
+library(rsample)
+
+variables <- c('year.n','month.n','week.n','education_927M','age','empl_industry_691L', 'familystate_447L', 'incometype_1044T','mainoccupationinc_384A','target')
+predictors <- variables[variables != "target"]
+
+home_train <- train_joined_tbl %>% select(all_of(variables))
+home_test <- test_joined_tbl %>% select(all_of(predictors ))
+
+```
+
+I'll use a random forest model as a pretty good out-of-box performer. We have several hyperparameters to optimize, however. They include number of predictor columns sampled (mtry), minimum observations per leaf (min_row), maximum tree depth (max_depth), and percent of observations sampled (sample_rate). The h2o package will use a random search of a combination of our hyperparameter grid and will stop if the RMSE does not improve by a specified amount. 
+
+```{r, eval = FALSE}
+library(h2o)
+# convert training data to h2o object
+h2o.no_progress()
+h2o.init(max_mem_size = "5g")
+
+# set the response column 
+train_h2o <- as.h2o(home_train)
+response <- "target"
+
+# number of features
+n_features <- length(setdiff(names(home_train), "target"))
+
+# set the predictor names
+predictors <- setdiff(colnames(home_train), response)
+
+h2o_rf1 <- h2o.randomForest(
+    x = predictors, 
+    y = response,
+    training_frame = train_h2o, 
+    ntrees = n_features * 10,
+    seed = 123
+)
+saveRDS(h2o_rf1,"h2o_rf1.rds")
+# hyperparameter grid
+hyper_grid <- list(
+  mtries = floor(n_features * c(.05, .15, .25, .333, .4)),
+  min_rows = c(1, 3, 5, 10),
+  max_depth = c(10, 20, 30),
+  sample_rate = c(.55, .632, .70, .80)
+)
+
+# random grid search strategy
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "mse",
+  stopping_tolerance = 0.001,   # stop if improvement is < 0.1%
+  stopping_rounds = 10,         # over the last 10 models
+  max_runtime_secs = 60*5      # or stop search after 5 min.
+)
+h2o.shutdown(prompt = FALSE)
+# h2o setup
+h2o.no_progress()
+h2o.init(max_mem_size = "5g")
+train_h2o <- as.h2o(home_train)
+
+ # perform grid search
+random_grid <- h2o.grid(
+  algorithm = "randomForest",
+  grid_id = "rf_random_grid",
+  x = predictors, 
+  y = response, 
+  training_frame = train_h2o,
+  hyper_params = hyper_grid,
+  ntrees = n_features * 10,
+  seed = 123,
+  stopping_metric = "RMSE",   
+  stopping_rounds = 10,           # stop if last 10 trees added 
+  stopping_tolerance = 0.005,     # don't improve RMSE by 0.5%
+  search_criteria = search_criteria
+)
+
+# Assess hyperparameter configurations
+summary(random_grid, show_stack_traces = TRUE)
+
+random_grid_perf <- h2o.getGrid(
+  grid_id = "rf_random_grid", 
+  sort_by = "mse", 
+  decreasing = FALSE
+)
+# Save computationally expensive objects to load later
+saveRDS(random_grid,"random_grid.rds")
+saveRDS(random_grid_perf,"random_grid_perf.rds")
+```
+
+We can examine the models that were ran and see exactly what hyperparameter combinations were examined. The output shows us that the final model had a mse of 0.03, a 0.0001 improvement over the last iteration. We can also see that there was a failed iteration. 
+
+```{r, include = FALSE}
+rdsread("random_grid")
+# summary(random_grid, show_stack_traces = TRUE)
+rdsread("random_grid_perf")
+random_grid_perf<- read_rds("random_grid_perf.rds")
+```
+
+
+```{r}
+random_grid_perf %>% summary() 
+```
+
+## Model validation
+
+### Preprocessing setup
+Set up tidymodels framework to preprocess and use train data information. 
+```{r}
+library(recipes)
+library(workflows)
+
+home_recipe <- recipe(target ~ ., data = home_train) 
+# recipe
+home_blueprint <- home_recipe  %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>% 
+  step_impute_knn(-all_outcomes())
+
+
+home_prep <- prep(home_blueprint, training = home_train)
+
+# near zero variance
+caret::nearZeroVar(home_train, saveMetrics = TRUE) %>% 
+  tibble::rownames_to_column() %>% 
+  filter(nzv)
+```
+
+### Set up random forest workflow 
+```{r}
+# cross validation folds
+cv_folds <-
+ vfold_cv(home_train, 
+          v = 5, 
+          strata = "target",
+          set.seed = 123) 
+
+# random forest specification
+rf_spec <- 
+  rand_forest(
+    mtry = 2,
+    min_n = 10
+  ) %>% 
+  set_engine("ranger", importance = "impurity", num.threads = 4) %>% 
+  set_mode("classification")
+
+# workflow
+rf_wflow_tuned <-
+ workflow() %>%
+ add_recipe(home_blueprint) %>% 
+ add_model(rf_spec) 
+```
+
+### Cross-validated Randomforest
+
+Test model with informed hyperparameters using cross-validation.
+```{r, eval = FALSE}
+# Use multiple cores
+all_cores <- parallel::detectCores(logical = FALSE)
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+# Run cross-validated random forest
+rf_res <-
+  rf_wflow_tuned %>%
+  fit_resamples(
+    resamples = cv_folds,
+    metrics = metric_set(
+      recall, precision, f_meas,
+      accuracy,roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE, allow_par = TRUE, parallel_over = "everything",verbose = TRUE)
+    )
+
+# Assess overall performance
+ rf_res %>%  collect_metrics(summarize = TRUE)
+ 
+# Observe individual model performance
+compare_cv_rf <- rf_res %>%  collect_metrics(summarize = FALSE) 
+
+saveRDS(rf_res, "rf_res.rds")
+saveRDS(compare_cv_rf, "compare_cv_rf.rds")
+```
+
+```{r}
+rdsread("rf_res")
+```
+
+
+```{r}
+rf_res %>%  collect_metrics(summarize = TRUE)
+```
+
+
+```{r}
+rf_res %>%  collect_metrics(summarize = FALSE) 
+```
+
+## Prediction
+
+Run informed model on test data and obtain predicted probabilities for `target` class.
+```{r, eval = FALSE}
+# preprocess recipe 
+preprocess_home <- recipe(target ~ ., data = home_train) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_predictors()) %>% 
+  step_impute_knn(-all_outcomes())
+
+
+# fit train data with tuned workflow
+home_rf_fit <- rf_wflow_tuned %>% 
+  fit(home_train)
+# extract recipe
+wf_extracted <- home_rf_fit %>% extract_recipe()
+# extract model
+home_final_tuned <- home_rf_fit %>% extract_fit_parsnip()
+
+# preprocess test data
+home_test_processed <- wf_extracted %>% bake(new_data = home_test)
+
+# predict test data using extracted model
+pred_home <- predict(home_final_tuned, new_data = home_test_processed)
+
+# predicted class probability 
+pred_probs <- predict(home_final_tuned, new_data = home_test_processed, type = "prob")
+# compare class prediction and prediction probability
+df_new_pre_processed <- cbind(pred_home, pred_probs)
+df_new_pre_processed
+
+saveRDS(df_new_pre_processed, "df_new_pre_processed.rds")
+
+```
+
+```{r, include = FALSE}
+rdsread("df_new_pre_processed")
+```
+
+
+```{r}
+df_new_pre_processed
+```
+
+
+
+
+
