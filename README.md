@@ -8,7 +8,7 @@ Welcome to the Home Credit prediction project! This repository contains the code
 
 The main objective of this project is to develop a predictive model that can classify customers into two categories: those who will likely default and those who won't. 
 
-![Home Credit](assets/homecredit.jpg)
+![Home Credit](assets/homecredit.jpeg)
 
 ## Dataset
 
