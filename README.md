@@ -8,7 +8,7 @@ Welcome to the Home Credit prediction project! This repository contains the code
 
 The main objective of this project is to develop a predictive model that can classify customers into two categories: those who will likely default and those who won't. 
 
-![Bank Churn](assets/bank.jpg)
+![Home Credit](assets/homecredit.jpg)
 
 ## Dataset
 
@@ -24,7 +24,7 @@ The project has largely been a data extraction and feature selection exercise.
 1. [Data extraction and brief EDA](Extract_EDA.md)
 - ~ 1.5 million user rows
 - Extensive SQL joins across ~30 tables
-2. [Random forest]
+2. [Random forest](RandomForest.md)
 - Random forest modeling in R
 - h2o cross-validated random grid search
 - tidymodels + ranger framework for random forests
